@@ -44,6 +44,9 @@ type claims struct {
 
 func main() {
 	err := godotenv.Load()
+	if err != nil {
+		panic(err)
+	}
 
 	botToken = os.Getenv("BOT_TOKEN")
 	jwtSecret = os.Getenv("JWT_SECRET")
@@ -112,43 +115,55 @@ func main() {
 		})
 	}
 
-	http.HandleFunc("/result", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	http.HandleFunc("/reset", func(w http.ResponseWriter, r *http.Request) {
+		jwtClaims, err := getClaims(r)
+		if err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
 
-		err := r.ParseForm()
+		scores, err := b.GameScores(&tele.User{ID: jwtClaims.UserID}, &tele.StoredMessage{
+			MessageID: jwtClaims.MessageID,
+		})
+		if err != nil {
+			http.Error(w, "internal scores error", http.StatusInternalServerError)
+			return
+		}
+
+		for _, score := range scores {
+			_, err := b.SetGameScore(score.User, &tele.StoredMessage{
+				MessageID: jwtClaims.MessageID,
+			}, tele.GameHighScore{
+				Score: 0,
+				Force: true,
+			})
+			if err != nil && !errors.Is(err, tele.ErrTrueResult) {
+				http.Error(w, "internal scores error", http.StatusInternalServerError)
+				return
+			}
+
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		_, err = w.Write([]byte("Result reset!"))
+		if err != nil {
+			http.Error(w, "internal write error", http.StatusInternalServerError)
+			return
+		}
+	})
+
+	http.HandleFunc("/result", func(w http.ResponseWriter, r *http.Request) {
+		jwtClaims, err := getClaims(r)
 		if err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
 
 		var currentGame Game
-		if g, ok := games[r.FormValue("game")]; ok {
+		if g, ok := games[jwtClaims.Game]; ok {
 			currentGame = g
 		} else {
 			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-
-		tokenString := r.FormValue("token")
-		token, err := jwt.ParseWithClaims(tokenString, &claims{}, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-
-			return []byte(jwtSecret), nil
-		})
-		if err != nil {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		var jwtClaims claims
-		if claims, ok := token.Claims.(*claims); ok {
-			jwtClaims = *claims
-		} else {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -181,4 +196,35 @@ func main() {
 		log.Fatal(err)
 		return
 	}
+}
+
+func getClaims(r *http.Request) (claims, error) {
+	if r.Method != http.MethodPost {
+		return claims{}, errors.New("method not allowed")
+	}
+
+	err := r.ParseForm()
+	if err != nil {
+		return claims{}, err
+	}
+
+	tokenString := r.FormValue("token")
+	token, err := jwt.ParseWithClaims(tokenString, &claims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+
+		return []byte(jwtSecret), nil
+	})
+	if err != nil {
+		return claims{}, err
+	}
+	var jwtClaims claims
+	if c, ok := token.Claims.(*claims); ok {
+		jwtClaims = *c
+	} else {
+		return claims{}, errors.New("unauthorized")
+	}
+
+	return jwtClaims, nil
 }
